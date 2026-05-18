@@ -1,1 +1,10 @@
-/target
+target/
+crash.log
+*.log
+scripts/
+LINUX/scripts/
+.idea/
+.vscode/
+node_modules/
+*.tmp
+*.cache
