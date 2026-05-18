@@ -33,7 +33,7 @@ const LAUNCHER_CONFIG_FILE: &str = "fusion_launcher_config.json";
 const EXPECTED_LAUNCH_SECONDS: u64 = 67;
 const MAX_MOD_PROFILES: u8 = 5;
 const APP_LOGO_PNG: &[u8] =
-    include_bytes!("../ChatGPT_Image_May_16__2026__01_12_41_PM-removebg-preview.png");
+    include_bytes!("../logo.png");
 
 static LAUNCHER_DIR: Lazy<ProjectDirs> = Lazy::new(|| {
     ProjectDirs::from("com", "fusion", "fusion-launcher")
