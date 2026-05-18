@@ -29,11 +29,12 @@ const MICROSOFT_SESSION_CACHE: &str = "microsoft_session.json";
 const CRASH_LOG_FILE: &str = "crash.log";
 const MOD_MANIFEST_FILE: &str = "fusion_mods_manifest.json";
 const SHADER_MANIFEST_FILE: &str = "fusion_shaderpacks_manifest.json";
+const RESOURCEPACK_MANIFEST_FILE: &str = "fusion_resourcepacks_manifest.json";
 const LAUNCHER_CONFIG_FILE: &str = "fusion_launcher_config.json";
 const EXPECTED_LAUNCH_SECONDS: u64 = 67;
 const MAX_MOD_PROFILES: u8 = 5;
-const APP_LOGO_PNG: &[u8] =
-    include_bytes!("../ChatGPT_Image_May_16__2026__01_12_41_PM-removebg-preview.png");
+const IRIS_PROJECT_ID: &str = "YL57xq9U";
+const APP_LOGO_PNG: &[u8] = include_bytes!("../logo.png");
 
 static LAUNCHER_DIR: Lazy<ProjectDirs> = Lazy::new(|| {
     ProjectDirs::from("com", "fusion", "fusion-launcher")
@@ -95,7 +96,81 @@ fn mod_profile_name(profile: u8) -> String {
     format!("Profile {}", clamp_mod_profile(profile))
 }
 
+fn default_profile_names() -> Vec<String> {
+    (1..=MAX_MOD_PROFILES).map(mod_profile_name).collect()
+}
+
+fn default_profile_colors() -> Vec<[u8; 4]> {
+    vec![
+        [187, 154, 247, 255],
+        [122, 162, 247, 255],
+        [158, 206, 106, 255],
+        [224, 175, 104, 255],
+        [247, 118, 142, 255],
+    ]
+}
+
+fn default_profile_images() -> Vec<String> {
+    vec![String::new(); MAX_MOD_PROFILES as usize]
+}
+
+fn normalize_profile_names(mut names: Vec<String>) -> Vec<String> {
+    names.truncate(MAX_MOD_PROFILES as usize);
+
+    for profile in 1..=MAX_MOD_PROFILES {
+        let index = (profile - 1) as usize;
+        if names.get(index).map_or(true, |name| name.trim().is_empty()) {
+            if index < names.len() {
+                names[index] = mod_profile_name(profile);
+            } else {
+                names.push(mod_profile_name(profile));
+            }
+        }
+    }
+
+    names
+}
+
+fn normalize_profile_colors(mut colors: Vec<[u8; 4]>) -> Vec<[u8; 4]> {
+    let defaults = default_profile_colors();
+    colors.truncate(MAX_MOD_PROFILES as usize);
+
+    for profile in 1..=MAX_MOD_PROFILES {
+        let index = (profile - 1) as usize;
+        if index >= colors.len() {
+            colors.push(defaults[index]);
+        }
+    }
+
+    colors
+}
+
+fn normalize_profile_images(mut images: Vec<String>) -> Vec<String> {
+    images.truncate(MAX_MOD_PROFILES as usize);
+    while images.len() < MAX_MOD_PROFILES as usize {
+        images.push(String::new());
+    }
+    images
+}
+
+fn profile_color_from_rgba(rgba: [u8; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
+}
+
+fn profile_color_to_rgba(color: egui::Color32) -> [u8; 4] {
+    [color.r(), color.g(), color.b(), color.a()]
+}
+
+fn profiles_root_dir() -> PathBuf {
+    instance_dir().join("profiles")
+}
+
 fn profile_root_dir(profile: u8) -> PathBuf {
+    let profile = clamp_mod_profile(profile);
+    profiles_root_dir().join(format!("profile-{}", profile))
+}
+
+fn legacy_profile_root_dir(profile: u8) -> PathBuf {
     let profile = clamp_mod_profile(profile);
     if profile == 1 {
         instance_dir()
@@ -145,8 +220,12 @@ fn isolated_instance_shaderpacks_dir(profile: u8, version: &str, loader: &str) -
     isolated_instance_subdir(profile, version, loader, "shaderpacks")
 }
 
+fn isolated_instance_resourcepacks_dir(profile: u8, version: &str, loader: &str) -> PathBuf {
+    isolated_instance_subdir(profile, version, loader, "resourcepacks")
+}
+
 fn legacy_profile_mods_dir(profile: u8) -> PathBuf {
-    profile_root_dir(profile).join("mods")
+    legacy_profile_root_dir(profile).join("mods")
 }
 
 fn legacy_nested_instance_dir(profile: u8, version: &str, loader: &str) -> PathBuf {
@@ -309,6 +388,30 @@ fn save_shader_manifest(
         .map_err(|e| format!("Failed to save shader manifest: {}", e))
 }
 
+fn load_resourcepack_manifest(resourcepacks_dir: &PathBuf) -> HashMap<String, String> {
+    let manifest_path = resourcepacks_dir.join(RESOURCEPACK_MANIFEST_FILE);
+    let Ok(raw_manifest) = fs::read_to_string(manifest_path) else {
+        return HashMap::new();
+    };
+
+    serde_json::from_str(&raw_manifest).unwrap_or_default()
+}
+
+fn save_resourcepack_manifest(
+    resourcepacks_dir: &PathBuf,
+    manifest: &HashMap<String, String>,
+) -> Result<(), String> {
+    fs::create_dir_all(resourcepacks_dir)
+        .map_err(|e| format!("Failed to prepare resourcepacks folder: {}", e))?;
+    let raw_manifest = serde_json::to_string_pretty(manifest)
+        .map_err(|e| format!("Failed to serialize resourcepack manifest: {}", e))?;
+    fs::write(
+        resourcepacks_dir.join(RESOURCEPACK_MANIFEST_FILE),
+        raw_manifest,
+    )
+    .map_err(|e| format!("Failed to save resourcepack manifest: {}", e))
+}
+
 fn open_folder(path: PathBuf) {
     let _ = Command::new("xdg-open").arg(path).spawn();
 }
@@ -384,6 +487,30 @@ fn modrinth_version_matches_profile(
     });
 
     version_matches && loader_matches
+}
+
+fn modrinth_version_stability_rank(version: &ModrinthVersion) -> u8 {
+    match version.version_type.as_str() {
+        "release" => 0,
+        "beta" => 1,
+        "alpha" => 2,
+        _ => 3,
+    }
+}
+
+fn choose_preferred_modrinth_version(
+    versions: Vec<ModrinthVersion>,
+    selected_version: &str,
+    selected_loader: &str,
+) -> Option<ModrinthVersion> {
+    versions
+        .into_iter()
+        .enumerate()
+        .filter(|(_, version)| {
+            modrinth_version_matches_profile(version, selected_version, selected_loader)
+        })
+        .min_by_key(|(index, version)| (modrinth_version_stability_rank(version), *index))
+        .map(|(_, version)| version)
 }
 
 fn is_project_installed_for_profile(
@@ -465,6 +592,60 @@ fn is_shader_installed_for_profile(
     manifest
         .values()
         .any(|stored_project_id| stored_project_id == project_id)
+}
+
+fn is_resourcepack_installed_for_profile(
+    project_id: &str,
+    selected_version: &str,
+    selected_loader: &str,
+    selected_mod_profile: u8,
+) -> bool {
+    let resourcepacks_dir = isolated_instance_resourcepacks_dir(
+        selected_mod_profile,
+        selected_version,
+        selected_loader,
+    );
+    let manifest = load_resourcepack_manifest(&resourcepacks_dir);
+
+    manifest
+        .values()
+        .any(|stored_project_id| stored_project_id == project_id)
+}
+
+fn is_iris_installed_for_profile(
+    selected_version: &str,
+    selected_loader: &str,
+    selected_mod_profile: u8,
+) -> bool {
+    if is_manifest_project_installed_for_profile(
+        IRIS_PROJECT_ID,
+        "iris",
+        "Iris Shaders",
+        selected_version,
+        selected_loader,
+        selected_mod_profile,
+    ) || is_manifest_project_installed_for_profile(
+        "iris",
+        "iris",
+        "Iris Shaders",
+        selected_version,
+        selected_loader,
+        selected_mod_profile,
+    ) {
+        return true;
+    }
+
+    let mods_dir =
+        isolated_instance_mods_dir(selected_mod_profile, selected_version, selected_loader);
+    let Ok(entries) = fs::read_dir(mods_dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        let filename = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        (filename.starts_with("iris-") || filename == "iris.jar" || filename == "iris.jar.bak")
+            && (filename.ends_with(".jar") || filename.ends_with(".jar.bak"))
+    })
 }
 
 fn loader_from_name(loader: &str) -> Result<Loader, String> {
@@ -1043,7 +1224,7 @@ async fn launch_minecraft(
         &terminal_logs,
         &format!(
             "Using {} isolated instance at {}.",
-            mod_profile_name(request.selected_mod_profile),
+            request.mod_profile_name,
             request.game_dir.display()
         ),
     );
@@ -1124,7 +1305,9 @@ async fn fetch_modrinth_project_version(
         .await
         .map_err(|e| format!("Version response could not be read: {}", e))?;
 
-    if let Some(version) = versions.into_iter().next() {
+    if let Some(version) =
+        choose_preferred_modrinth_version(versions, selected_version, selected_loader)
+    {
         return Ok(version);
     }
 
@@ -1150,11 +1333,7 @@ async fn fetch_modrinth_project_version(
         .await
         .map_err(|e| format!("Version fallback response could not be read: {}", e))?;
 
-    versions
-        .into_iter()
-        .find(|version| {
-            modrinth_version_matches_profile(version, selected_version, selected_loader)
-        })
+    choose_preferred_modrinth_version(versions, selected_version, selected_loader)
         .ok_or_else(|| "No compatible version was found for this profile.".to_string())
 }
 
@@ -1181,7 +1360,9 @@ async fn fetch_modrinth_install_version(
                 .await
                 .map_err(|e| format!("Version response could not be read: {}", e))?;
 
-            if modrinth_version_matches_profile(&version, selected_version, selected_loader) {
+            if modrinth_version_matches_profile(&version, selected_version, selected_loader)
+                && version.version_type == "release"
+            {
                 Ok(version)
             } else {
                 fetch_modrinth_project_version(
@@ -1368,6 +1549,49 @@ async fn install_modrinth_shader_project(
     Ok(filename)
 }
 
+async fn fetch_modrinth_resourcepack_version(
+    client: &reqwest::Client,
+    project_id: String,
+    selected_version: &str,
+) -> Result<ModrinthVersion, String> {
+    let game_versions = format!(r#"["{}"]"#, selected_version);
+
+    let versions = client
+        .get(format!(
+            "https://api.modrinth.com/v2/project/{}/version",
+            project_id
+        ))
+        .header("User-Agent", "FusionLauncher/0.1.0")
+        .query(&[("game_versions", game_versions.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("Resource pack version lookup failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Resource pack version lookup was rejected: {}", e))?
+        .json::<Vec<ModrinthVersion>>()
+        .await
+        .map_err(|e| format!("Resource pack version response could not be read: {}", e))?;
+
+    choose_preferred_modrinth_version(versions, selected_version, "Vanilla").ok_or_else(|| {
+        "No compatible resource pack version was found for this Minecraft version.".to_string()
+    })
+}
+
+async fn install_modrinth_resourcepack_project(
+    client: &reqwest::Client,
+    resourcepacks_dir: &PathBuf,
+    project_id: String,
+    selected_version: &str,
+) -> Result<String, String> {
+    let version = fetch_modrinth_resourcepack_version(client, project_id, selected_version).await?;
+    let filename = download_modrinth_version_file(client, resourcepacks_dir, &version).await?;
+    let mut manifest = load_resourcepack_manifest(resourcepacks_dir);
+    manifest.insert(filename.clone(), version.project_id.clone());
+    save_resourcepack_manifest(resourcepacks_dir, &manifest)?;
+
+    Ok(filename)
+}
+
 #[derive(Deserialize, Clone, Debug)]
 struct ModrinthResult {
     title: String,
@@ -1385,6 +1609,8 @@ struct ModrinthSearchResponse {
 struct ModrinthVersion {
     id: String,
     project_id: String,
+    #[serde(default)]
+    version_type: String,
     #[serde(default)]
     game_versions: Vec<String>,
     #[serde(default)]
@@ -1428,6 +1654,12 @@ struct LauncherConfig {
     selected_loader: String,
     #[serde(default = "default_mod_profile")]
     selected_mod_profile: u8,
+    #[serde(default = "default_profile_names")]
+    profile_names: Vec<String>,
+    #[serde(default = "default_profile_colors")]
+    profile_colors: Vec<[u8; 4]>,
+    #[serde(default = "default_profile_images")]
+    profile_images: Vec<String>,
     username: String,
     allocated_ram_gb: u32,
     cpu_cores: u32,
@@ -1443,6 +1675,9 @@ impl Default for LauncherConfig {
             selected_version: "1.21.1".to_string(),
             selected_loader: "Fabric".to_string(),
             selected_mod_profile: 1,
+            profile_names: default_profile_names(),
+            profile_colors: default_profile_colors(),
+            profile_images: default_profile_images(),
             username: "Test".to_string(),
             allocated_ram_gb: 4,
             cpu_cores: 4,
@@ -1459,7 +1694,7 @@ struct LaunchRequest {
     username: String,
     selected_version: String,
     selected_loader: String,
-    selected_mod_profile: u8,
+    mod_profile_name: String,
     game_dir: PathBuf,
     auth_mode: AuthMode,
     ms_profile: Option<UserProfile>,
@@ -1477,8 +1712,10 @@ enum ModrinthInstallTarget {
 enum ActiveTab {
     Play,
     Mods,
+    ModProfiles,
     Skins,
     Shaders,
+    ResourcePacks,
     Settings,
 }
 
@@ -1883,6 +2120,12 @@ struct FusionLauncherApp {
     selected_version: String,
     selected_loader: String,
     selected_mod_profile: u8,
+    profile_names: Vec<String>,
+    profile_colors: Vec<[u8; 4]>,
+    profile_images: Vec<String>,
+    profile_settings_target: Option<u8>,
+    profile_settings_name: String,
+    profile_settings_image: String,
     status_text: Arc<Mutex<String>>,
     is_launching: Arc<Mutex<bool>>,
     found_mods: Vec<(String, bool)>,
@@ -1895,6 +2138,9 @@ struct FusionLauncherApp {
     shader_search_query: String,
     shader_search_results: Arc<Mutex<Vec<ModrinthResult>>>,
     is_shader_searching: Arc<Mutex<bool>>,
+    resourcepack_search_query: String,
+    resourcepack_search_results: Arc<Mutex<Vec<ModrinthResult>>>,
+    is_resourcepack_searching: Arc<Mutex<bool>>,
     last_folder_scan: Instant,
     skin_path_input: String,
     terminal_logs: Arc<Mutex<Vec<String>>>,
@@ -1915,7 +2161,6 @@ struct FusionLauncherApp {
     loader_availability: Arc<Mutex<HashMap<String, HashMap<String, bool>>>>,
     is_checking_loader_availability: Arc<Mutex<bool>>,
     last_loader_availability_request: String,
-    taskbar_icon_applied: bool,
 }
 
 impl FusionLauncherApp {
@@ -1953,6 +2198,12 @@ impl FusionLauncherApp {
             selected_version: launcher_config.selected_version.clone(),
             selected_loader: launcher_config.selected_loader.clone(),
             selected_mod_profile: clamp_mod_profile(launcher_config.selected_mod_profile),
+            profile_names: normalize_profile_names(launcher_config.profile_names.clone()),
+            profile_colors: normalize_profile_colors(launcher_config.profile_colors.clone()),
+            profile_images: normalize_profile_images(launcher_config.profile_images.clone()),
+            profile_settings_target: None,
+            profile_settings_name: String::new(),
+            profile_settings_image: String::new(),
             status_text: Arc::new(Mutex::new(
                 cached_profile
                     .as_ref()
@@ -1970,6 +2221,9 @@ impl FusionLauncherApp {
             shader_search_query: "".to_string(),
             shader_search_results: Arc::new(Mutex::new(Vec::new())),
             is_shader_searching: Arc::new(Mutex::new(false)),
+            resourcepack_search_query: "".to_string(),
+            resourcepack_search_results: Arc::new(Mutex::new(Vec::new())),
+            is_resourcepack_searching: Arc::new(Mutex::new(false)),
             last_folder_scan: Instant::now() - Duration::from_secs(5),
             skin_path_input: launcher_config.skin_path_input.clone(),
             terminal_logs: logs,
@@ -1994,7 +2248,6 @@ impl FusionLauncherApp {
             loader_availability: Arc::new(Mutex::new(HashMap::new())),
             is_checking_loader_availability: Arc::new(Mutex::new(false)),
             last_loader_availability_request: String::new(),
-            taskbar_icon_applied: false,
         };
 
         let _ = app.migrate_legacy_mods_for_current_environment();
@@ -2020,6 +2273,9 @@ impl FusionLauncherApp {
             selected_version: self.selected_version.clone(),
             selected_loader: self.selected_loader.clone(),
             selected_mod_profile: self.selected_mod_profile,
+            profile_names: normalize_profile_names(self.profile_names.clone()),
+            profile_colors: normalize_profile_colors(self.profile_colors.clone()),
+            profile_images: normalize_profile_images(self.profile_images.clone()),
             username: self.username.clone(),
             allocated_ram_gb: self.allocated_ram_gb,
             cpu_cores: self.cpu_cores,
@@ -2035,6 +2291,9 @@ impl FusionLauncherApp {
         if current_config.selected_version == self.last_saved_config.selected_version
             && current_config.selected_loader == self.last_saved_config.selected_loader
             && current_config.selected_mod_profile == self.last_saved_config.selected_mod_profile
+            && current_config.profile_names == self.last_saved_config.profile_names
+            && current_config.profile_colors == self.last_saved_config.profile_colors
+            && current_config.profile_images == self.last_saved_config.profile_images
             && current_config.username == self.last_saved_config.username
             && current_config.allocated_ram_gb == self.last_saved_config.allocated_ram_gb
             && current_config.cpu_cores == self.last_saved_config.cpu_cores
@@ -2112,6 +2371,85 @@ impl FusionLauncherApp {
         )
     }
 
+    fn current_resourcepacks_dir(&self) -> PathBuf {
+        isolated_instance_resourcepacks_dir(
+            self.selected_mod_profile,
+            &self.selected_version,
+            &self.selected_loader,
+        )
+    }
+
+    fn migrate_legacy_instance_dir_for_current_environment(&mut self) -> Result<usize, String> {
+        let legacy_instance_dir = legacy_profile_root_dir(self.selected_mod_profile)
+            .join("instances")
+            .join(instance_folder_name(
+                &self.selected_version,
+                &self.selected_loader,
+            ));
+        let target_instance_dir = self.current_game_dir();
+
+        if !legacy_instance_dir.exists() || legacy_instance_dir == target_instance_dir {
+            return Ok(0);
+        }
+
+        let target_parent = target_instance_dir
+            .parent()
+            .ok_or_else(|| "Current instance path has no parent directory.".to_string())?;
+        fs::create_dir_all(target_parent)
+            .map_err(|e| format!("Failed to prepare profile instance folder: {}", e))?;
+
+        if !target_instance_dir.exists() {
+            fs::rename(&legacy_instance_dir, &target_instance_dir).map_err(|e| {
+                format!(
+                    "Failed to move legacy instance {} to {}: {}",
+                    legacy_instance_dir.display(),
+                    target_instance_dir.display(),
+                    e
+                )
+            })?;
+            self.log_to_terminal(&format!(
+                "Moved legacy instance into isolated profile folder: {}.",
+                target_instance_dir.display()
+            ));
+            return Ok(1);
+        }
+
+        let mut migrated_count = 0;
+        for folder in [
+            "mods",
+            "config",
+            "saves",
+            "resourcepacks",
+            "shaderpacks",
+            "logs",
+        ] {
+            let source = legacy_instance_dir.join(folder);
+            let target = target_instance_dir.join(folder);
+            if source.exists() && !target.exists() {
+                fs::rename(&source, &target).map_err(|e| {
+                    format!(
+                        "Failed to move legacy {} folder to {}: {}",
+                        folder,
+                        target.display(),
+                        e
+                    )
+                })?;
+                migrated_count += 1;
+            }
+        }
+
+        if migrated_count > 0 {
+            self.log_to_terminal(&format!(
+                "Moved {} legacy instance folder{} into {}.",
+                migrated_count,
+                if migrated_count == 1 { "" } else { "s" },
+                target_instance_dir.display()
+            ));
+        }
+
+        Ok(migrated_count)
+    }
+
     fn iris_supported_for_selected_loader(&self) -> bool {
         matches!(
             self.selected_loader.as_str(),
@@ -2120,6 +2458,7 @@ impl FusionLauncherApp {
     }
 
     fn migrate_legacy_mods_for_current_environment(&mut self) -> Result<usize, String> {
+        let _ = self.migrate_legacy_instance_dir_for_current_environment()?;
         let legacy_mods_dir = legacy_profile_mods_dir(self.selected_mod_profile);
         let legacy_nested_mods_dir = legacy_nested_instance_mods_dir(
             self.selected_mod_profile,
@@ -2315,7 +2654,7 @@ impl FusionLauncherApp {
             username: self.username.clone(),
             selected_version: self.selected_version.clone(),
             selected_loader: self.selected_loader.clone(),
-            selected_mod_profile: self.selected_mod_profile,
+            mod_profile_name: self.profile_display_name(self.selected_mod_profile),
             game_dir: self.current_game_dir(),
             auth_mode: self.auth_mode.clone(),
             ms_profile: self.ms_profile.lock().unwrap().clone(),
@@ -2567,6 +2906,83 @@ impl FusionLauncherApp {
         });
     }
 
+    fn trigger_resourcepack_search(&self, ctx: &egui::Context) {
+        let query = self.resourcepack_search_query.trim().to_string();
+
+        *self.is_resourcepack_searching.lock().unwrap() = true;
+        *self.status_text.lock().unwrap() = if query.is_empty() {
+            "Searching Modrinth resource packs...".to_string()
+        } else {
+            format!("Searching Modrinth resource packs for {}...", query)
+        };
+
+        let selected_version = self.selected_version.clone();
+        let resourcepack_search_results = Arc::clone(&self.resourcepack_search_results);
+        let is_resourcepack_searching = Arc::clone(&self.is_resourcepack_searching);
+        let status_text = Arc::clone(&self.status_text);
+        let terminal_logs = Arc::clone(&self.terminal_logs);
+        let ctx_refresh = ctx.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let client = reqwest::Client::new();
+                let facets = format!(
+                    r#"[["project_type:resourcepack"],["versions:{}"]]"#,
+                    selected_version
+                );
+                let result = client
+                    .get("https://api.modrinth.com/v2/search")
+                    .header("User-Agent", "FusionLauncher/0.1.0")
+                    .query(&[
+                        ("query", query.as_str()),
+                        ("limit", "12"),
+                        ("index", "downloads"),
+                        ("facets", facets.as_str()),
+                    ])
+                    .send()
+                    .await
+                    .map_err(|e| format!("Resource pack search request failed: {}", e));
+
+                match result {
+                    Ok(response) => match response.error_for_status() {
+                        Ok(response) => match response.json::<ModrinthSearchResponse>().await {
+                            Ok(payload) => {
+                                let hit_count = payload.hits.len();
+                                *resourcepack_search_results.lock().unwrap() = payload.hits;
+                                *status_text.lock().unwrap() =
+                                    format!("Found {} resource pack results.", hit_count);
+                                if let Ok(mut logs) = terminal_logs.lock() {
+                                    logs.push(format!(
+                                        "[RESOURCEPACKS] Modrinth returned {} resource pack results for '{}' on {}.",
+                                        hit_count, query, selected_version
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                *status_text.lock().unwrap() =
+                                    format!("Resource pack search response could not be read: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            *status_text.lock().unwrap() =
+                                format!("Resource pack search failed: {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        *status_text.lock().unwrap() = e.clone();
+                        if let Ok(mut logs) = terminal_logs.lock() {
+                            logs.push(format!("[ERROR] {}", e));
+                        }
+                    }
+                }
+
+                *is_resourcepack_searching.lock().unwrap() = false;
+                ctx_refresh.request_repaint();
+            });
+        });
+    }
+
     fn trigger_mod_download(&mut self, ctx: &egui::Context, project_id: String, title: String) {
         let selected_version = self.selected_version.clone();
         let selected_loader = self.selected_loader.clone();
@@ -2684,6 +3100,66 @@ impl FusionLauncherApp {
                             format!("Installed shaderpack {}.", filename);
                         if let Ok(mut logs) = terminal_logs.lock() {
                             logs.push(format!("[SHADERS] Installed {} from Modrinth.", filename));
+                        }
+                    }
+                    Err(e) => {
+                        *status_text.lock().unwrap() = e.clone();
+                        if let Ok(mut logs) = terminal_logs.lock() {
+                            logs.push(format!("[ERROR] {}", e));
+                        }
+                    }
+                }
+
+                ctx_refresh.request_repaint();
+            });
+        });
+    }
+
+    fn trigger_resourcepack_download(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: String,
+        title: String,
+    ) {
+        let selected_version = self.selected_version.clone();
+        let status_text = Arc::clone(&self.status_text);
+        let terminal_logs = Arc::clone(&self.terminal_logs);
+        let ctx_refresh = ctx.clone();
+        let game_dir = self.current_game_dir();
+        let resourcepacks_dir = self.current_resourcepacks_dir();
+
+        *status_text.lock().unwrap() = format!("Getting resource pack {}...", title);
+        self.log_to_terminal(&format!(
+            "Resolving resource pack candidate for {} on {}...",
+            title, selected_version
+        ));
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let result = async {
+                    prepare_isolated_instance(&game_dir)?;
+
+                    let client = reqwest::Client::new();
+                    install_modrinth_resourcepack_project(
+                        &client,
+                        &resourcepacks_dir,
+                        project_id,
+                        &selected_version,
+                    )
+                    .await
+                }
+                .await;
+
+                match result {
+                    Ok(filename) => {
+                        *status_text.lock().unwrap() =
+                            format!("Installed resource pack {}.", filename);
+                        if let Ok(mut logs) = terminal_logs.lock() {
+                            logs.push(format!(
+                                "[RESOURCEPACKS] Installed {} from Modrinth.",
+                                filename
+                            ));
                         }
                     }
                     Err(e) => {
@@ -3015,21 +3491,179 @@ impl FusionLauncherApp {
         });
     }
 
-    fn show_mod_profile_selector(&mut self, ui: &mut egui::Ui, id_source: &str) {
-        let old_profile = self.selected_mod_profile;
-        egui::ComboBox::from_id_source(id_source)
-            .selected_text(mod_profile_name(self.selected_mod_profile))
-            .width(130.0)
-            .show_ui(ui, |ui| {
-                for profile in 1..=MAX_MOD_PROFILES {
-                    ui.selectable_value(
-                        &mut self.selected_mod_profile,
-                        profile,
-                        mod_profile_name(profile),
+    fn profile_display_name(&self, profile: u8) -> String {
+        let profile = clamp_mod_profile(profile);
+        self.profile_names
+            .get((profile - 1) as usize)
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| mod_profile_name(profile))
+    }
+
+    fn compact_profile_display_name(&self, profile: u8) -> String {
+        let name = self.profile_display_name(profile);
+        let max_chars = 18;
+        if name.chars().count() <= max_chars {
+            return name;
+        }
+
+        let mut compact = name.chars().take(max_chars - 3).collect::<String>();
+        compact.push_str("...");
+        compact
+    }
+
+    fn profile_image_path(&self, profile: u8) -> String {
+        let profile = clamp_mod_profile(profile);
+        self.profile_images
+            .get((profile - 1) as usize)
+            .map(|path| path.trim())
+            .filter(|path| !path.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_default()
+    }
+
+    fn begin_profile_settings(&mut self, profile: u8) {
+        let profile = clamp_mod_profile(profile);
+        self.profile_settings_target = Some(profile);
+        self.profile_settings_name = self.profile_display_name(profile);
+        self.profile_settings_image = self.profile_image_path(profile);
+    }
+
+    fn apply_profile_settings(&mut self) {
+        let Some(profile) = self.profile_settings_target else {
+            return;
+        };
+
+        self.profile_names = normalize_profile_names(self.profile_names.clone());
+        self.profile_images = normalize_profile_images(self.profile_images.clone());
+        let name = self.profile_settings_name.trim();
+        let final_name = if name.is_empty() {
+            mod_profile_name(profile)
+        } else {
+            name.to_string()
+        };
+
+        self.profile_names[(profile - 1) as usize] = final_name.clone();
+        self.profile_images[(profile - 1) as usize] =
+            self.profile_settings_image.trim().to_string();
+        self.profile_settings_target = None;
+        self.profile_settings_name.clear();
+        self.profile_settings_image.clear();
+        self.log_to_terminal(&format!("Updated settings for {}.", final_name));
+    }
+
+    fn show_mod_profiles_tab(&mut self, ui: &mut egui::Ui) {
+        self.profile_names = normalize_profile_names(self.profile_names.clone());
+        self.profile_colors = normalize_profile_colors(self.profile_colors.clone());
+
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new("Mod Profiles").strong());
+            ui.add_space(6.0);
+
+            for profile in 1..=MAX_MOD_PROFILES {
+                let index = (profile - 1) as usize;
+                ui.horizontal(|ui| {
+                    ui.label(format!("Profile {}:", profile));
+                    ui.add_sized(
+                        [170.0, 22.0],
+                        egui::TextEdit::singleline(&mut self.profile_names[index]),
                     );
+
+                    let mut color = profile_color_from_rgba(self.profile_colors[index]);
+                    if ui.color_edit_button_srgba(&mut color).changed() {
+                        self.profile_colors[index] = profile_color_to_rgba(color);
+                    }
+
+                    if self.selected_mod_profile == profile {
+                        ui.label(egui::RichText::new("Active").small().strong());
+                    } else if ui.small_button("Use").clicked() {
+                        let old_profile = self.selected_mod_profile;
+                        self.selected_mod_profile = profile;
+                        if old_profile != self.selected_mod_profile {
+                            self.compatibility_results.clear();
+                            let _ = self.migrate_legacy_mods_for_current_environment();
+                            self.refresh_mods_list();
+                            self.log_to_terminal(&format!(
+                                "Switched to {}.",
+                                self.profile_display_name(self.selected_mod_profile)
+                            ));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    fn show_profile_settings_window(&mut self, ctx: &egui::Context) {
+        let Some(profile) = self.profile_settings_target else {
+            return;
+        };
+
+        let mut save_requested = false;
+        let mut cancel_requested = false;
+
+        egui::Window::new("Profile Settings")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Profile {}", profile));
+
+                ui.label("Name");
+                let response = ui.text_edit_singleline(&mut self.profile_settings_name);
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    save_requested = true;
                 }
+
+                ui.add_space(8.0);
+                ui.label("Image path");
+                ui.text_edit_singleline(&mut self.profile_settings_image);
+                ui.label(
+                    egui::RichText::new("Leave image blank to use the default profile style.")
+                        .small()
+                        .weak(),
+                );
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save_requested = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_requested = true;
+                    }
+                });
             });
 
+        if save_requested {
+            self.apply_profile_settings();
+        } else if cancel_requested {
+            self.profile_settings_target = None;
+            self.profile_settings_name.clear();
+            self.profile_settings_image.clear();
+        }
+    }
+
+    fn show_mod_profile_selector(&mut self, ui: &mut egui::Ui, id_source: &str) {
+        let old_profile = self.selected_mod_profile;
+        let combo_response = egui::ComboBox::from_id_source(id_source)
+            .selected_text(self.compact_profile_display_name(self.selected_mod_profile))
+            .width(112.0)
+            .show_ui(ui, |ui| {
+                for profile in 1..=MAX_MOD_PROFILES {
+                    let label = self.compact_profile_display_name(profile);
+                    ui.selectable_value(&mut self.selected_mod_profile, profile, label);
+                }
+            });
+        if combo_response.response.secondary_clicked() {
+            self.begin_profile_settings(self.selected_mod_profile);
+        }
+        combo_response.response.context_menu(|ui| {
+            if ui.button("Profile settings").clicked() {
+                self.begin_profile_settings(self.selected_mod_profile);
+                ui.close_menu();
+            }
+        });
         self.selected_mod_profile = clamp_mod_profile(self.selected_mod_profile);
         if old_profile != self.selected_mod_profile {
             self.compatibility_results.clear();
@@ -3037,7 +3671,7 @@ impl FusionLauncherApp {
             self.refresh_mods_list();
             self.log_to_terminal(&format!(
                 "Switched to {}.",
-                mod_profile_name(self.selected_mod_profile)
+                self.profile_display_name(self.selected_mod_profile)
             ));
         }
     }
@@ -3045,10 +3679,7 @@ impl FusionLauncherApp {
 
 impl eframe::App for FusionLauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.taskbar_icon_applied {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(Arc::new(load_app_icon()))));
-            self.taskbar_icon_applied = true;
-        }
+        self.show_profile_settings_window(ctx);
 
         if !*self.is_launching.lock().unwrap() {
             self.launch_started_at = None;
@@ -3182,8 +3813,10 @@ impl eframe::App for FusionLauncherApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.current_tab, ActiveTab::Play, "🎮 Play");
                 ui.selectable_value(&mut self.current_tab, ActiveTab::Mods, "📦 Mods");
+                ui.selectable_value(&mut self.current_tab, ActiveTab::ModProfiles, "Mod Profiles");
                 ui.selectable_value(&mut self.current_tab, ActiveTab::Skins, "👕 Skins");
                 ui.selectable_value(&mut self.current_tab, ActiveTab::Shaders, "Shaders");
+                ui.selectable_value(&mut self.current_tab, ActiveTab::ResourcePacks, "Resource Packs");
                 ui.selectable_value(&mut self.current_tab, ActiveTab::Settings, "⚙ Settings");
             });
             ui.separator();
@@ -3459,8 +4092,12 @@ impl eframe::App for FusionLauncherApp {
                                         ui.add_space(4.0);
                                     }
                                 }
-                            });
+                        });
                     });
+                }
+
+                ActiveTab::ModProfiles => {
+                    self.show_mod_profiles_tab(ui);
                 }
 
                 ActiveTab::Skins => {
@@ -3496,16 +4133,13 @@ impl eframe::App for FusionLauncherApp {
 
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            let iris_installed = is_manifest_project_installed_for_profile(
-                                "iris",
-                                "iris",
-                                "Iris Shaders",
+                            let iris_installed = is_iris_installed_for_profile(
                                 &self.selected_version,
                                 &self.selected_loader,
                                 self.selected_mod_profile,
                             );
                             let iris_text = if iris_installed {
-                                "Iris Installed"
+                                "Already Installed"
                             } else {
                                 "Download Iris"
                             };
@@ -3615,6 +4249,117 @@ impl eframe::App for FusionLauncherApp {
                                                             );
                                                         } else if ui.small_button("Get").clicked() {
                                                             self.trigger_shader_download(
+                                                                ctx,
+                                                                result.project_id.clone(),
+                                                                result.title.clone(),
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                            ui.label(
+                                                egui::RichText::new(&result.description)
+                                                    .weak()
+                                                    .small(),
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                }
+                            });
+                    });
+                }
+
+                ActiveTab::ResourcePacks => {
+                    ui.group(|ui| {
+                        ui.set_width(ui.available_width());
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Resource Packs").strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Open Resourcepacks Folder").clicked() {
+                                    let resourcepacks_dir = self.current_resourcepacks_dir();
+                                    open_folder(resourcepacks_dir);
+                                }
+                            });
+                        });
+
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Search Modrinth Resource Packs ({})",
+                                self.selected_version
+                            ))
+                            .strong(),
+                        );
+                        ui.add_space(4.0);
+
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.resourcepack_search_query);
+                            let search_btn_text =
+                                if *self.is_resourcepack_searching.lock().unwrap() {
+                                    "Searching...".to_string()
+                                } else {
+                                    "Search Resource Packs".to_string()
+                                };
+
+                            if ui.button(search_btn_text).clicked()
+                                && !*self.is_resourcepack_searching.lock().unwrap()
+                            {
+                                self.trigger_resourcepack_search(ctx);
+                            }
+                        });
+
+                        ui.hyperlink_to(
+                            "Open Modrinth Resource Packs",
+                            "https://modrinth.com/resourcepacks",
+                        );
+
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .id_source("resourcepack_results_scroll")
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                let results =
+                                    self.resourcepack_search_results.lock().unwrap().clone();
+                                if results.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Resource pack results will appear here.",
+                                        )
+                                        .weak()
+                                        .italics(),
+                                    );
+                                } else {
+                                    for result in results {
+                                        ui.group(|ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(&result.title).strong(),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        let is_installed =
+                                                            is_resourcepack_installed_for_profile(
+                                                                &result.project_id,
+                                                                &self.selected_version,
+                                                                &self.selected_loader,
+                                                                self.selected_mod_profile,
+                                                            );
+
+                                                        if is_installed {
+                                                            ui.add_enabled(
+                                                                false,
+                                                                egui::Button::new(
+                                                                    "Already Installed",
+                                                                ),
+                                                            );
+                                                        } else if ui.small_button("Get").clicked() {
+                                                            self.trigger_resourcepack_download(
                                                                 ctx,
                                                                 result.project_id.clone(),
                                                                 result.title.clone(),
