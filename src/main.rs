@@ -261,6 +261,50 @@ fn mod_display_name(filename: &str) -> String {
     base.to_string()
 }
 
+fn pack_display_name(filename: &str) -> String {
+    filename
+        .strip_suffix(".zip.bak")
+        .or_else(|| filename.strip_suffix(".zip"))
+        .unwrap_or(filename)
+        .to_string()
+}
+
+fn scan_pack_files(pack_dir: &PathBuf, manifest_filename: &str) -> Vec<(String, bool)> {
+    if !pack_dir.exists() {
+        let _ = fs::create_dir_all(pack_dir);
+    }
+
+    let mut packs = Vec::new();
+    if let Ok(entries) = fs::read_dir(pack_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let filename = entry.file_name().to_string_lossy().to_string();
+            if filename == manifest_filename {
+                continue;
+            }
+
+            if filename.ends_with(".zip") {
+                packs.push((filename, true));
+            } else if filename.ends_with(".zip.bak") {
+                let clean_name = filename
+                    .strip_suffix(".bak")
+                    .unwrap_or(&filename)
+                    .to_string();
+                if !pack_dir.join(&clean_name).exists() {
+                    packs.push((clean_name, false));
+                }
+            }
+        }
+    }
+
+    packs.sort_by(|left, right| left.0.to_lowercase().cmp(&right.0.to_lowercase()));
+    packs
+}
+
 fn normalized_mod_name(filename: &str) -> String {
     mod_display_name(filename)
         .chars()
@@ -994,6 +1038,91 @@ fn latest_log_was_touched(game_dir: &PathBuf, launch_started: SystemTime) -> boo
         .and_then(|metadata| metadata.modified())
         .map(|modified| modified >= threshold)
         .unwrap_or(false)
+}
+
+fn newest_crash_report_path(game_dir: &PathBuf) -> Option<PathBuf> {
+    fs::read_dir(game_dir.join("crash-reports"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+
+            let filename = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+            if !filename.ends_with(".txt") {
+                return None;
+            }
+
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
+fn interesting_crash_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "caused by:",
+        "exception",
+        "error",
+        "failed",
+        "missing",
+        "mixin",
+        "mod ",
+        ".jar",
+        "fabricloader",
+        "forge",
+        "neoforge",
+        "quilt",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn analyze_log_text(source_name: &str, text: &str, findings: &mut Vec<String>) {
+    for line in text.lines().filter(|line| interesting_crash_line(line)).take(8) {
+        let clean_line = line.trim();
+        if clean_line.is_empty() {
+            continue;
+        }
+
+        findings.push(format!("{}: {}", source_name, clean_line));
+        if findings.len() >= 12 {
+            break;
+        }
+    }
+}
+
+fn analyze_crash_sources(game_dir: &PathBuf) -> Vec<String> {
+    let mut findings = Vec::new();
+    let sources = [
+        ("Launcher crash.log", crash_log_path()),
+        ("Minecraft latest.log", game_dir.join("logs").join("latest.log")),
+    ];
+
+    for (source_name, path) in sources {
+        if let Ok(text) = fs::read_to_string(&path) {
+            analyze_log_text(source_name, &text, &mut findings);
+        }
+    }
+
+    if let Some(path) = newest_crash_report_path(game_dir) {
+        if let Ok(text) = fs::read_to_string(path) {
+            analyze_log_text("Newest crash report", &text, &mut findings);
+        }
+    }
+
+    if findings.is_empty() {
+        findings.push(
+            "No obvious crash lines found. Launch once, let Minecraft fail, then run this again."
+                .to_string(),
+        );
+    }
+
+    findings
 }
 
 async fn execute_minecraft_process(
@@ -2176,6 +2305,7 @@ struct FusionLauncherApp {
     resourcepack_search_query: String,
     resourcepack_search_results: Arc<Mutex<Vec<ModrinthResult>>>,
     is_resourcepack_searching: Arc<Mutex<bool>>,
+    crash_analysis_results: Vec<String>,
     last_folder_scan: Instant,
     skin_path_input: String,
     terminal_logs: Arc<Mutex<Vec<String>>>,
@@ -2259,6 +2389,7 @@ impl FusionLauncherApp {
             resourcepack_search_query: "".to_string(),
             resourcepack_search_results: Arc::new(Mutex::new(Vec::new())),
             is_resourcepack_searching: Arc::new(Mutex::new(false)),
+            crash_analysis_results: Vec::new(),
             last_folder_scan: Instant::now() - Duration::from_secs(5),
             skin_path_input: launcher_config.skin_path_input.clone(),
             terminal_logs: logs,
@@ -2825,6 +2956,20 @@ impl FusionLauncherApp {
                 ctx_refresh.request_repaint();
             });
         });
+    }
+
+    fn analyze_current_crash_logs(&mut self) {
+        self.crash_analysis_results = analyze_crash_sources(&self.current_game_dir());
+        *self.status_text.lock().unwrap() = format!(
+            "Crash helper found {} item{}.",
+            self.crash_analysis_results.len(),
+            if self.crash_analysis_results.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        self.log_to_terminal("Crash helper analyzed launcher and instance logs.");
     }
 
     fn trigger_mod_search(&self, ctx: &egui::Context, target_db: &str) {
@@ -3535,6 +3680,28 @@ impl FusionLauncherApp {
                 }
                 self.last_folder_scan = Instant::now();
             }
+        }
+    }
+
+    fn toggle_pack_file(&self, pack_dir: PathBuf, pack_name: String, currently_enabled: bool) {
+        let (source_path, target_path) = if currently_enabled {
+            (
+                pack_dir.join(&pack_name),
+                pack_dir.join(format!("{}.bak", pack_name)),
+            )
+        } else {
+            (
+                pack_dir.join(format!("{}.bak", pack_name)),
+                pack_dir.join(&pack_name),
+            )
+        };
+
+        if fs::rename(&source_path, &target_path).is_ok() {
+            self.log_to_terminal(&format!(
+                "{} {}.",
+                if currently_enabled { "Disabled" } else { "Enabled" },
+                pack_display_name(&pack_name)
+            ));
         }
     }
 
@@ -4271,6 +4438,53 @@ impl eframe::App for FusionLauncherApp {
                                 );
                             }
                         });
+
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Current Shader Packs").strong());
+                        let shaderpacks_dir = self.current_shaderpacks_dir();
+                        let shaderpacks = scan_pack_files(&shaderpacks_dir, SHADER_MANIFEST_FILE);
+                        egui::ScrollArea::vertical()
+                            .id_source("local_shaderpacks_scroll")
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                if shaderpacks.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("No shader packs installed.")
+                                            .weak()
+                                            .italics(),
+                                    );
+                                } else {
+                                    for (pack_name, enabled) in shaderpacks {
+                                        ui.horizontal(|ui| {
+                                            let mut is_enabled = enabled;
+                                            if ui.checkbox(&mut is_enabled, "").changed() {
+                                                self.toggle_pack_file(
+                                                    shaderpacks_dir.clone(),
+                                                    pack_name.clone(),
+                                                    enabled,
+                                                );
+                                            }
+
+                                            let label = if enabled {
+                                                egui::RichText::new(pack_display_name(&pack_name))
+                                            } else {
+                                                egui::RichText::new(pack_display_name(&pack_name))
+                                                    .color(egui::Color32::from_rgb(239, 83, 80))
+                                                    .strikethrough()
+                                                    .weak()
+                                            };
+                                            ui.label(label).on_hover_text(if enabled {
+                                                format!("Enabled shader pack.\n{}", pack_name)
+                                            } else {
+                                                format!(
+                                                    "Disabled. Check it to enable this shader pack.\n{}",
+                                                    pack_name
+                                                )
+                                            });
+                                        });
+                                    }
+                                }
+                            });
                     });
 
                     ui.add_space(10.0);
@@ -4300,11 +4514,6 @@ impl eframe::App for FusionLauncherApp {
                                 self.trigger_shader_search(ctx);
                             }
                         });
-
-                        ui.hyperlink_to(
-                            "Open Modrinth Shaders",
-                            "https://modrinth.com/discover/shaders",
-                        );
 
                         ui.add_space(8.0);
                         egui::ScrollArea::vertical()
@@ -4388,6 +4597,54 @@ impl eframe::App for FusionLauncherApp {
                         });
 
                         ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Current Resource Packs").strong());
+                        let resourcepacks_dir = self.current_resourcepacks_dir();
+                        let resourcepacks =
+                            scan_pack_files(&resourcepacks_dir, RESOURCEPACK_MANIFEST_FILE);
+                        egui::ScrollArea::vertical()
+                            .id_source("local_resourcepacks_scroll")
+                            .max_height(130.0)
+                            .show(ui, |ui| {
+                                if resourcepacks.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("No resource packs installed.")
+                                            .weak()
+                                            .italics(),
+                                    );
+                                } else {
+                                    for (pack_name, enabled) in resourcepacks {
+                                        ui.horizontal(|ui| {
+                                            let mut is_enabled = enabled;
+                                            if ui.checkbox(&mut is_enabled, "").changed() {
+                                                self.toggle_pack_file(
+                                                    resourcepacks_dir.clone(),
+                                                    pack_name.clone(),
+                                                    enabled,
+                                                );
+                                            }
+
+                                            let label = if enabled {
+                                                egui::RichText::new(pack_display_name(&pack_name))
+                                            } else {
+                                                egui::RichText::new(pack_display_name(&pack_name))
+                                                    .color(egui::Color32::from_rgb(239, 83, 80))
+                                                    .strikethrough()
+                                                    .weak()
+                                            };
+                                            ui.label(label).on_hover_text(if enabled {
+                                                format!("Enabled resource pack.\n{}", pack_name)
+                                            } else {
+                                                format!(
+                                                    "Disabled. Check it to enable this resource pack.\n{}",
+                                                    pack_name
+                                                )
+                                            });
+                                        });
+                                    }
+                                }
+                            });
+
+                        ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(format!(
                                 "Search Modrinth Resource Packs ({})",
@@ -4412,11 +4669,6 @@ impl eframe::App for FusionLauncherApp {
                                 self.trigger_resourcepack_search(ctx);
                             }
                         });
-
-                        ui.hyperlink_to(
-                            "Open Modrinth Resource Packs",
-                            "https://modrinth.com/resourcepacks",
-                        );
 
                         ui.add_space(8.0);
                         egui::ScrollArea::vertical()
@@ -4558,6 +4810,49 @@ impl eframe::App for FusionLauncherApp {
                                 self.install_java_runtime(ctx);
                             }
                         });
+                    });
+
+                    ui.add_space(10.0);
+
+                    ui.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(egui::RichText::new("Crash Helper").strong());
+                        ui.add_space(6.0);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Analyze Latest Crash").clicked() {
+                                self.analyze_current_crash_logs();
+                            }
+                            if ui.button("Open Crash Log").clicked() {
+                                let _ = std::process::Command::new("notepad")
+                                    .arg(crash_log_path())
+                                    .spawn();
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .id_source("crash_helper_results")
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                if self.crash_analysis_results.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Run the analyzer after a failed launch.",
+                                        )
+                                        .weak()
+                                        .italics(),
+                                    );
+                                } else {
+                                    for finding in &self.crash_analysis_results {
+                                        ui.label(
+                                            egui::RichText::new(finding)
+                                                .small()
+                                                .monospace(),
+                                        );
+                                    }
+                                }
+                            });
                     });
 
                     ui.add_space(10.0);
