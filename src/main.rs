@@ -9,13 +9,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 const MINECRAFT_VERSIONS: &[&str] = &[
     "26.1.2", "26.1.1", "26.1", "1.21.11", "1.21.10", "1.21.9", "1.21.8", "1.21.7", "1.21.6",
@@ -31,11 +34,9 @@ const MOD_MANIFEST_FILE: &str = "fusion_mods_manifest.json";
 const SHADER_MANIFEST_FILE: &str = "fusion_shaderpacks_manifest.json";
 const RESOURCEPACK_MANIFEST_FILE: &str = "fusion_resourcepacks_manifest.json";
 const LAUNCHER_CONFIG_FILE: &str = "fusion_launcher_config.json";
-const EXPECTED_LAUNCH_SECONDS: u64 = 67;
 const MAX_MOD_PROFILES: u8 = 5;
 const IRIS_PROJECT_ID: &str = "YL57xq9U";
-const APP_LOGO_PNG: &[u8] =
-    include_bytes!("../logo.png");
+const APP_LOGO_PNG: &[u8] = include_bytes!("../logo.png");
 
 static LAUNCHER_DIR: Lazy<ProjectDirs> = Lazy::new(|| {
     ProjectDirs::from("com", "fusion", "fusion-launcher")
@@ -101,16 +102,6 @@ fn default_profile_names() -> Vec<String> {
     (1..=MAX_MOD_PROFILES).map(mod_profile_name).collect()
 }
 
-fn default_profile_colors() -> Vec<[u8; 4]> {
-    vec![
-        [187, 154, 247, 255],
-        [122, 162, 247, 255],
-        [158, 206, 106, 255],
-        [224, 175, 104, 255],
-        [247, 118, 142, 255],
-    ]
-}
-
 fn default_profile_images() -> Vec<String> {
     vec![String::new(); MAX_MOD_PROFILES as usize]
 }
@@ -132,34 +123,12 @@ fn normalize_profile_names(mut names: Vec<String>) -> Vec<String> {
     names
 }
 
-fn normalize_profile_colors(mut colors: Vec<[u8; 4]>) -> Vec<[u8; 4]> {
-    let defaults = default_profile_colors();
-    colors.truncate(MAX_MOD_PROFILES as usize);
-
-    for profile in 1..=MAX_MOD_PROFILES {
-        let index = (profile - 1) as usize;
-        if index >= colors.len() {
-            colors.push(defaults[index]);
-        }
-    }
-
-    colors
-}
-
 fn normalize_profile_images(mut images: Vec<String>) -> Vec<String> {
     images.truncate(MAX_MOD_PROFILES as usize);
     while images.len() < MAX_MOD_PROFILES as usize {
         images.push(String::new());
     }
     images
-}
-
-fn profile_color_from_rgba(rgba: [u8; 4]) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
-}
-
-fn profile_color_to_rgba(color: egui::Color32) -> [u8; 4] {
-    [color.r(), color.g(), color.b(), color.a()]
 }
 
 fn profiles_root_dir() -> PathBuf {
@@ -169,6 +138,89 @@ fn profiles_root_dir() -> PathBuf {
 fn profile_root_dir(profile: u8) -> PathBuf {
     let profile = clamp_mod_profile(profile);
     profiles_root_dir().join(format!("profile-{}", profile))
+}
+
+fn profile_import_dir(profile: u8) -> PathBuf {
+    profile_root_dir(profile).join("import")
+}
+
+fn profile_export_dir(profile: u8) -> PathBuf {
+    profile_root_dir(profile).join("export")
+}
+
+fn profile_export_zip_path(profile: u8) -> PathBuf {
+    profile_export_dir(profile).join(format!(
+        "fusion-{}.zip",
+        mod_profile_name(profile).replace(' ', "-").to_lowercase()
+    ))
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                directory_size_bytes(&path)
+            } else {
+                entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+            }
+        })
+        .sum()
+}
+
+fn profile_game_data_size_bytes(profile: u8) -> u64 {
+    profile_instances_dir(profile)
+        .read_dir()
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|instance_dir| {
+            directory_size_bytes(&instance_dir.join("mods"))
+        })
+        .sum()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0;
+
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[unit_index])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit_index])
+    }
+}
+
+fn count_profile_mod_files(profile: u8) -> usize {
+    fs::read_dir(profile_instances_dir(profile))
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .map(|entry| entry.path().join("mods"))
+        .flat_map(|mods_dir| {
+            fs::read_dir(mods_dir)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.flatten())
+        })
+        .filter(|entry| {
+            let filename = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            filename.ends_with(".jar") || filename.ends_with(".jar.bak")
+        })
+        .count()
 }
 
 fn legacy_profile_root_dir(profile: u8) -> PathBuf {
@@ -335,7 +387,6 @@ fn fallback_loader_supported_for_version(loader: &str, version: &str) -> bool {
             version.starts_with("26.")
                 || (version.starts_with("1.") && minecraft_version_at_least(version, 1, 20, 1))
         }
-        "Forge" => version == "1.20.1",
         _ => false,
     }
 }
@@ -387,9 +438,66 @@ fn system_ram_limit_gb() -> u32 {
     ((memory_status.ull_total_phys + gib - 1) / gib).clamp(1, u32::MAX as u64) as u32
 }
 
+#[cfg(windows)]
+fn system_swap_limit_gb() -> u32 {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        dw_length: u32,
+        dw_memory_load: u32,
+        ull_total_phys: u64,
+        ull_avail_phys: u64,
+        ull_total_page_file: u64,
+        ull_avail_page_file: u64,
+        ull_total_virtual: u64,
+        ull_avail_virtual: u64,
+        ull_avail_extended_virtual: u64,
+    }
+
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut memory_status = MemoryStatusEx {
+        dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        dw_memory_load: 0,
+        ull_total_phys: 0,
+        ull_avail_phys: 0,
+        ull_total_page_file: 0,
+        ull_avail_page_file: 0,
+        ull_total_virtual: 0,
+        ull_avail_virtual: 0,
+        ull_avail_extended_virtual: 0,
+    };
+
+    let ok = unsafe { GlobalMemoryStatusEx(&mut memory_status) };
+    if ok == 0 || memory_status.ull_total_page_file <= memory_status.ull_total_phys {
+        return 0;
+    }
+
+    let swap_bytes = memory_status.ull_total_page_file - memory_status.ull_total_phys;
+    let gib = 1024_u64 * 1024 * 1024;
+    ((swap_bytes + gib - 1) / gib).clamp(0, u32::MAX as u64) as u32
+}
+
 #[cfg(not(windows))]
 fn system_ram_limit_gb() -> u32 {
     32
+}
+
+#[cfg(not(windows))]
+fn system_swap_limit_gb() -> u32 {
+    let Ok(raw_swaps) = fs::read_to_string("/proc/swaps") else {
+        return 0;
+    };
+
+    let total_kib = raw_swaps
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().nth(2))
+        .filter_map(|size_kib| size_kib.parse::<u64>().ok())
+        .sum::<u64>();
+    let gib_kib = 1024_u64 * 1024;
+    ((total_kib + gib_kib - 1) / gib_kib).clamp(0, u32::MAX as u64) as u32
 }
 
 fn load_launcher_config() -> LauncherConfig {
@@ -472,8 +580,11 @@ fn save_resourcepack_manifest(
         .map_err(|e| format!("Failed to prepare resourcepacks folder: {}", e))?;
     let raw_manifest = serde_json::to_string_pretty(manifest)
         .map_err(|e| format!("Failed to serialize resourcepack manifest: {}", e))?;
-    fs::write(resourcepacks_dir.join(RESOURCEPACK_MANIFEST_FILE), raw_manifest)
-        .map_err(|e| format!("Failed to save resourcepack manifest: {}", e))
+    fs::write(
+        resourcepacks_dir.join(RESOURCEPACK_MANIFEST_FILE),
+        raw_manifest,
+    )
+    .map_err(|e| format!("Failed to save resourcepack manifest: {}", e))
 }
 
 fn prepare_isolated_instance(instance_dir: &PathBuf) -> Result<(), String> {
@@ -696,7 +807,8 @@ fn is_iris_installed_for_profile(
         return true;
     }
 
-    let mods_dir = isolated_instance_mods_dir(selected_mod_profile, selected_version, selected_loader);
+    let mods_dir =
+        isolated_instance_mods_dir(selected_mod_profile, selected_version, selected_loader);
     let Ok(entries) = fs::read_dir(mods_dir) else {
         return false;
     };
@@ -714,7 +826,6 @@ fn loader_from_name(loader: &str) -> Result<Loader, String> {
         "Fabric" => Ok(Loader::Fabric),
         "Quilt" => Ok(Loader::Quilt),
         "NeoForge" => Ok(Loader::NeoForge),
-        "Forge" => Ok(Loader::NeoForge),
         other => Err(format!("Unknown loader: {}", other)),
     }
 }
@@ -781,44 +892,8 @@ async fn resolve_loader_version(loader: &str, minecraft_version: &str) -> Result
                 .ok_or_else(|| format!("No Quilt loader found for {}.", minecraft_version))
         }
         "NeoForge" => resolve_neoforge_version(minecraft_version).await,
-        "Forge" => resolve_neoforged_forge_version(minecraft_version).await,
         other => Err(format!("Unknown loader: {}", other)),
     }
-}
-
-fn forge_version_key(full_version: &str, minecraft_version: &str) -> Vec<u32> {
-    full_version
-        .strip_prefix(&format!("{}-", minecraft_version))
-        .unwrap_or(full_version)
-        .split(|ch: char| !ch.is_ascii_digit())
-        .filter_map(|part| part.parse::<u32>().ok())
-        .collect()
-}
-
-async fn resolve_neoforged_forge_version(minecraft_version: &str) -> Result<String, String> {
-    let metadata =
-        reqwest::get("https://maven.neoforged.net/releases/net/neoforged/forge/maven-metadata.xml")
-            .await
-            .map_err(|e| format!("Failed to fetch Forge metadata: {}", e))?
-            .error_for_status()
-            .map_err(|e| format!("Forge metadata lookup failed: {}", e))?
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read Forge metadata: {}", e))?;
-
-    let prefix = format!("{}-", minecraft_version);
-    let mut matches = metadata
-        .split("<version>")
-        .filter_map(|chunk| chunk.split("</version>").next())
-        .filter(|version| version.starts_with(&prefix))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-
-    matches.sort_by_key(|version| forge_version_key(version, minecraft_version));
-    matches
-        .pop()
-        .and_then(|version| version.strip_prefix(&prefix).map(str::to_string))
-        .ok_or_else(|| format!("No Forge loader found for {}.", minecraft_version))
 }
 
 async fn resolve_neoforge_version(minecraft_version: &str) -> Result<String, String> {
@@ -1040,8 +1115,129 @@ fn latest_log_was_touched(game_dir: &PathBuf, launch_started: SystemTime) -> boo
         .unwrap_or(false)
 }
 
-fn newest_crash_report_path(game_dir: &PathBuf) -> Option<PathBuf> {
-    fs::read_dir(game_dir.join("crash-reports"))
+fn zip_relative_name(base_dir: &Path, path: &Path) -> Result<String, String> {
+    path.strip_prefix(base_dir)
+        .map_err(|e| format!("Failed to build zip path: {}", e))
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn add_dir_to_zip(
+    zip: &mut ZipWriter<File>,
+    base_dir: &Path,
+    current_dir: &Path,
+    target_zip_path: &Path,
+    options: SimpleFileOptions,
+) -> Result<(), String> {
+    for entry in fs::read_dir(current_dir)
+        .map_err(|e| format!("Failed to scan {}: {}", current_dir.display(), e))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read profile file entry: {}", e))?;
+        let path = entry.path();
+        if path == target_zip_path {
+            continue;
+        }
+
+        let name = zip_relative_name(base_dir, &path)?;
+        if path.is_dir() {
+            if !name.is_empty() {
+                zip.add_directory(format!("{}/", name.trim_end_matches('/')), options)
+                    .map_err(|e| format!("Failed to add folder to zip: {}", e))?;
+            }
+            add_dir_to_zip(zip, base_dir, &path, target_zip_path, options)?;
+        } else if path.is_file() {
+            zip.start_file(name, options)
+                .map_err(|e| format!("Failed to add file to zip: {}", e))?;
+            let mut source = File::open(&path)
+                .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+            std::io::copy(&mut source, zip)
+                .map_err(|e| format!("Failed to write {} into zip: {}", path.display(), e))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn export_profile_zip(profile: u8, zip_path: &Path) -> Result<(), String> {
+    let profile_dir = profile_root_dir(profile);
+    fs::create_dir_all(&profile_dir)
+        .map_err(|e| format!("Failed to prepare profile folder: {}", e))?;
+
+    if let Some(parent) = zip_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to prepare export folder: {}", e))?;
+    }
+
+    let zip_file = File::create(zip_path)
+        .map_err(|e| format!("Failed to create {}: {}", zip_path.display(), e))?;
+    let mut zip = ZipWriter::new(zip_file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    add_dir_to_zip(&mut zip, &profile_dir, &profile_dir, zip_path, options)?;
+    zip.finish()
+        .map_err(|e| format!("Failed to finish profile zip: {}", e))?;
+    Ok(())
+}
+
+fn import_profile_zip(profile: u8, zip_path: &Path) -> Result<(), String> {
+    let profile_dir = profile_root_dir(profile);
+    fs::create_dir_all(&profile_dir)
+        .map_err(|e| format!("Failed to prepare profile folder: {}", e))?;
+
+    let zip_file = File::open(zip_path)
+        .map_err(|e| format!("Failed to open {}: {}", zip_path.display(), e))?;
+    let mut archive =
+        ZipArchive::new(zip_file).map_err(|e| format!("Failed to read profile zip: {}", e))?;
+
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|e| format!("Failed to read zip entry: {}", e))?;
+        let Some(enclosed_name) = file.enclosed_name().map(|path| path.to_path_buf()) else {
+            continue;
+        };
+        let target_path = profile_dir.join(enclosed_name);
+
+        if file.is_dir() {
+            fs::create_dir_all(&target_path).map_err(|e| {
+                format!(
+                    "Failed to create imported folder {}: {}",
+                    target_path.display(),
+                    e
+                )
+            })?;
+            continue;
+        }
+
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "Failed to prepare import folder {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+
+        let mut output = File::create(&target_path).map_err(|e| {
+            format!(
+                "Failed to create imported file {}: {}",
+                target_path.display(),
+                e
+            )
+        })?;
+        std::io::copy(&mut file, &mut output).map_err(|e| {
+            format!(
+                "Failed to extract imported file {}: {}",
+                target_path.display(),
+                e
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn newest_zip_in_dir(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter_map(|entry| {
@@ -1050,8 +1246,11 @@ fn newest_crash_report_path(game_dir: &PathBuf) -> Option<PathBuf> {
                 return None;
             }
 
-            let filename = path.file_name()?.to_string_lossy().to_ascii_lowercase();
-            if !filename.ends_with(".txt") {
+            let is_zip = path
+                .extension()
+                .map(|extension| extension.to_string_lossy().eq_ignore_ascii_case("zip"))
+                .unwrap_or(false);
+            if !is_zip {
                 return None;
             }
 
@@ -1062,67 +1261,35 @@ fn newest_crash_report_path(game_dir: &PathBuf) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
-fn interesting_crash_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    [
-        "caused by:",
-        "exception",
-        "error",
-        "failed",
-        "missing",
-        "mixin",
-        "mod ",
-        ".jar",
-        "fabricloader",
-        "forge",
-        "neoforge",
-        "quilt",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
+fn open_folder(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|e| format!("Failed to prepare folder {}: {}", path.display(), e))?;
 
-fn analyze_log_text(source_name: &str, text: &str, findings: &mut Vec<String>) {
-    for line in text.lines().filter(|line| interesting_crash_line(line)).take(8) {
-        let clean_line = line.trim();
-        if clean_line.is_empty() {
-            continue;
-        }
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        command.arg(path);
+        command
+    };
 
-        findings.push(format!("{}: {}", source_name, clean_line));
-        if findings.len() >= 12 {
-            break;
-        }
-    }
-}
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
 
-fn analyze_crash_sources(game_dir: &PathBuf) -> Vec<String> {
-    let mut findings = Vec::new();
-    let sources = [
-        ("Launcher crash.log", crash_log_path()),
-        ("Minecraft latest.log", game_dir.join("logs").join("latest.log")),
-    ];
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
 
-    for (source_name, path) in sources {
-        if let Ok(text) = fs::read_to_string(&path) {
-            analyze_log_text(source_name, &text, &mut findings);
-        }
-    }
-
-    if let Some(path) = newest_crash_report_path(game_dir) {
-        if let Ok(text) = fs::read_to_string(path) {
-            analyze_log_text("Newest crash report", &text, &mut findings);
-        }
-    }
-
-    if findings.is_empty() {
-        findings.push(
-            "No obvious crash lines found. Launch once, let Minecraft fail, then run this again."
-                .to_string(),
-        );
-    }
-
-    findings
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open {}: {}", path.display(), e))
 }
 
 async fn execute_minecraft_process(
@@ -1247,6 +1414,53 @@ fn ensure_game_dir_argument(mut arguments: Vec<String>, game_dir: &PathBuf) -> V
     arguments
 }
 
+fn sync_resource_jvm_args(args: &str, ram_gb: u32, swap_gb: u32) -> String {
+    let mut kept_args = args
+        .split_whitespace()
+        .filter(|arg| {
+            let trimmed = arg.trim_start_matches('-');
+            !trimmed.starts_with("Xmx")
+                && !trimmed.starts_with("Xms")
+                && !trimmed.starts_with("Dfusion.swapAllowanceGb=")
+                && !trimmed.starts_with("XX:MaxRAM=")
+        })
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    let mut resource_args = vec![
+        format!("-Xmx{}G", ram_gb),
+        "-Xms1G".to_string(),
+        format!("-Dfusion.swapAllowanceGb={}", swap_gb),
+    ];
+    if swap_gb > 0 {
+        resource_args.push(format!("-XX:MaxRAM={}G", ram_gb.saturating_add(swap_gb)));
+    }
+    resource_args.append(&mut kept_args);
+    resource_args.join(" ")
+}
+
+fn parse_xmx_ram_gb(args: &str) -> Option<u32> {
+    args.split_whitespace().find_map(|arg| {
+        let value = arg.trim_start_matches('-').strip_prefix("Xmx")?;
+        if let Some(gb) = value.strip_suffix(['G', 'g']) {
+            gb.parse::<u32>().ok()
+        } else if let Some(mb) = value.strip_suffix(['M', 'm']) {
+            mb.parse::<u32>().ok().map(|mb| (mb / 1024).max(1))
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_swap_allowance_gb(args: &str) -> Option<u32> {
+    args.split_whitespace().find_map(|arg| {
+        arg.trim_start_matches('-')
+            .strip_prefix("Dfusion.swapAllowanceGb=")?
+            .parse::<u32>()
+            .ok()
+    })
+}
+
 fn build_minecraft_launch_arguments<V: LaunchArguments>(
     version: &V,
     version_data: &Version,
@@ -1269,11 +1483,15 @@ fn build_minecraft_launch_arguments<V: LaunchArguments>(
 
     for arg in request.custom_jvm_args.split_whitespace() {
         let trimmed = arg.trim_start_matches('-');
-        if trimmed.is_empty() || trimmed.starts_with("Xmx") || trimmed.starts_with("Xms") {
+        if trimmed.is_empty() {
             continue;
         }
 
-        if let Some((key, value)) = trimmed.split_once('=') {
+        if let Some(value) = trimmed.strip_prefix("Xmx") {
+            jvm_overrides.insert("Xmx".to_string(), value.to_string());
+        } else if let Some(value) = trimmed.strip_prefix("Xms") {
+            jvm_overrides.insert("Xms".to_string(), value.to_string());
+        } else if let Some((key, value)) = trimmed.split_once('=') {
             jvm_overrides.insert(key.to_string(), value.to_string());
         } else {
             jvm_overrides.insert(trimmed.to_string(), String::new());
@@ -1308,8 +1526,10 @@ fn build_minecraft_launch_arguments<V: LaunchArguments>(
 async fn launch_minecraft(
     request: LaunchRequest,
     terminal_logs: Arc<Mutex<Vec<String>>>,
+    launch_progress: Arc<Mutex<LaunchProgress>>,
 ) -> Result<(), String> {
     let launch_started = SystemTime::now();
+    set_launch_progress(&launch_progress, 0.08, "Resolving loader.");
     push_terminal_log(
         &terminal_logs,
         &format!(
@@ -1317,16 +1537,11 @@ async fn launch_minecraft(
             request.selected_loader, request.selected_version
         ),
     );
-    if request.selected_loader == "Forge" {
-        push_terminal_log(
-            &terminal_logs,
-            "Forge profile selected; using the NeoForge-compatible launch backend.",
-        );
-    }
 
     let loader = loader_from_name(&request.selected_loader)?;
     let loader_version =
         resolve_loader_version(&request.selected_loader, &request.selected_version).await?;
+    set_launch_progress(&launch_progress, 0.18, "Authenticating player.");
     push_terminal_log(
         &terminal_logs,
         &format!(
@@ -1356,6 +1571,7 @@ async fn launch_minecraft(
         &format!("Using player profile: {}.", profile.username),
     );
 
+    set_launch_progress(&launch_progress, 0.30, "Preparing isolated instance.");
     let version = VersionBuilder::new(
         "Fusion-Core-Instance",
         loader,
@@ -1374,6 +1590,7 @@ async fn launch_minecraft(
         ),
     );
 
+    set_launch_progress(&launch_progress, 0.42, "Fetching launch metadata.");
     let metadata = match version.loader() {
         Loader::Vanilla => version.get_complete().await,
         Loader::Fabric => version.get_fabric_complete().await,
@@ -1391,20 +1608,28 @@ async fn launch_minecraft(
         }
     };
 
+    set_launch_progress(&launch_progress, 0.56, "Selecting Java runtime.");
     let java_path = select_java_binary(&version, version_data, &terminal_logs).await?;
 
+    set_launch_progress(
+        &launch_progress,
+        0.68,
+        "Installing and verifying Minecraft files.",
+    );
     push_terminal_log(&terminal_logs, "Installing/verifying Minecraft files...");
     version
         .install(version_data, None)
         .await
         .map_err(|e| format!("Install failed: {:?}", e))?;
 
+    set_launch_progress(&launch_progress, 0.84, "Building launch arguments.");
     let arguments = build_minecraft_launch_arguments(&version, version_data, &profile, &request);
     push_terminal_log(
         &terminal_logs,
         &format!("Launch --gameDir is {}.", request.game_dir.display()),
     );
 
+    set_launch_progress(&launch_progress, 0.94, "Starting Minecraft process.");
     push_terminal_log(&terminal_logs, "Starting the Minecraft Java process...");
 
     execute_minecraft_process(
@@ -1416,6 +1641,7 @@ async fn launch_minecraft(
     )
     .await?;
 
+    set_launch_progress(&launch_progress, 1.0, "Minecraft closed.");
     push_terminal_log(&terminal_logs, "Minecraft process finished successfully.");
     Ok(())
 }
@@ -1530,7 +1756,6 @@ fn modrinth_loader_category(loader: &str) -> Option<&'static str> {
     match loader {
         "Fabric" => Some("fabric"),
         "Quilt" => Some("quilt"),
-        "Forge" => Some("forge"),
         "NeoForge" => Some("neoforge"),
         _ => None,
     }
@@ -1801,13 +2026,12 @@ struct LauncherConfig {
     selected_mod_profile: u8,
     #[serde(default = "default_profile_names")]
     profile_names: Vec<String>,
-    #[serde(default = "default_profile_colors")]
-    profile_colors: Vec<[u8; 4]>,
     #[serde(default = "default_profile_images")]
     profile_images: Vec<String>,
     username: String,
     allocated_ram_gb: u32,
     cpu_cores: u32,
+    swap_usage_gb: u32,
     use_dedicated_gpu: bool,
     enable_gpu_optimizations: bool,
     custom_jvm_args: String,
@@ -1821,11 +2045,11 @@ impl Default for LauncherConfig {
             selected_loader: "Fabric".to_string(),
             selected_mod_profile: 1,
             profile_names: default_profile_names(),
-            profile_colors: default_profile_colors(),
             profile_images: default_profile_images(),
             username: "Test".to_string(),
             allocated_ram_gb: 4,
             cpu_cores: 4,
+            swap_usage_gb: 0,
             use_dedicated_gpu: true,
             enable_gpu_optimizations: true,
             custom_jvm_args: "-XX:+UseG1GC -XX:+UnlockExperimentalVMOptions".to_string(),
@@ -1846,6 +2070,31 @@ struct LaunchRequest {
     allocated_ram_gb: u32,
     custom_jvm_args: String,
     enable_gpu_optimizations: bool,
+}
+
+#[derive(Clone)]
+struct LaunchProgress {
+    fraction: f32,
+    label: String,
+}
+
+impl Default for LaunchProgress {
+    fn default() -> Self {
+        Self {
+            fraction: 0.0,
+            label: "Waiting.".to_string(),
+        }
+    }
+}
+
+fn set_launch_progress(
+    progress: &Arc<Mutex<LaunchProgress>>,
+    fraction: f32,
+    label: impl Into<String>,
+) {
+    let mut progress = progress.lock().unwrap();
+    progress.fraction = fraction.clamp(0.0, 1.0);
+    progress.label = label.into();
 }
 
 enum ModrinthInstallTarget {
@@ -2212,6 +2461,8 @@ fn run_launcher() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Fusion Launcher")
             .with_inner_size([500.0, 620.0])
+            .with_min_inner_size([500.0, 620.0])
+            .with_max_inner_size([500.0, 620.0])
             .with_resizable(false)
             .with_icon(load_app_icon()),
         ..Default::default()
@@ -2285,13 +2536,13 @@ struct FusionLauncherApp {
     selected_loader: String,
     selected_mod_profile: u8,
     profile_names: Vec<String>,
-    profile_colors: Vec<[u8; 4]>,
     profile_images: Vec<String>,
     profile_settings_target: Option<u8>,
     profile_settings_name: String,
     profile_settings_image: String,
     status_text: Arc<Mutex<String>>,
     is_launching: Arc<Mutex<bool>>,
+    launch_progress: Arc<Mutex<LaunchProgress>>,
     found_mods: Vec<(String, bool)>,
     compatibility_results: Vec<CompatibilityResult>,
     current_tab: ActiveTab,
@@ -2305,7 +2556,6 @@ struct FusionLauncherApp {
     resourcepack_search_query: String,
     resourcepack_search_results: Arc<Mutex<Vec<ModrinthResult>>>,
     is_resourcepack_searching: Arc<Mutex<bool>>,
-    crash_analysis_results: Vec<String>,
     last_folder_scan: Instant,
     skin_path_input: String,
     terminal_logs: Arc<Mutex<Vec<String>>>,
@@ -2316,12 +2566,13 @@ struct FusionLauncherApp {
     auth_refresh_trigger: Arc<Mutex<bool>>,
     allocated_ram_gb: u32,
     cpu_cores: u32,
+    swap_usage_gb: u32,
+    detected_swap_gb: u32,
     use_dedicated_gpu: bool,
     enable_gpu_optimizations: bool,
     custom_jvm_args: String,
     java_status: Arc<Mutex<String>>,
     is_installing_java: Arc<Mutex<bool>>,
-    launch_started_at: Option<Instant>,
     last_saved_config: LauncherConfig,
     loader_availability: Arc<Mutex<HashMap<String, HashMap<String, bool>>>>,
     is_checking_loader_availability: Arc<Mutex<bool>>,
@@ -2354,6 +2605,7 @@ impl FusionLauncherApp {
 
         let max_ram_gb = system_ram_limit_gb();
         let max_cpu_cores = system_cpu_limit();
+        let detected_swap_gb = system_swap_limit_gb();
 
         let mut app = Self {
             username: cached_profile
@@ -2364,7 +2616,6 @@ impl FusionLauncherApp {
             selected_loader: launcher_config.selected_loader.clone(),
             selected_mod_profile: clamp_mod_profile(launcher_config.selected_mod_profile),
             profile_names: normalize_profile_names(launcher_config.profile_names.clone()),
-            profile_colors: normalize_profile_colors(launcher_config.profile_colors.clone()),
             profile_images: normalize_profile_images(launcher_config.profile_images.clone()),
             profile_settings_target: None,
             profile_settings_name: String::new(),
@@ -2376,6 +2627,7 @@ impl FusionLauncherApp {
                     .unwrap_or_else(|| "Ready to launch client.".to_string()),
             )),
             is_launching: Arc::new(Mutex::new(false)),
+            launch_progress: Arc::new(Mutex::new(LaunchProgress::default())),
             found_mods: Vec::new(),
             compatibility_results: Vec::new(),
             current_tab: ActiveTab::Play,
@@ -2389,7 +2641,6 @@ impl FusionLauncherApp {
             resourcepack_search_query: "".to_string(),
             resourcepack_search_results: Arc::new(Mutex::new(Vec::new())),
             is_resourcepack_searching: Arc::new(Mutex::new(false)),
-            crash_analysis_results: Vec::new(),
             last_folder_scan: Instant::now() - Duration::from_secs(5),
             skin_path_input: launcher_config.skin_path_input.clone(),
             terminal_logs: logs,
@@ -2404,12 +2655,17 @@ impl FusionLauncherApp {
             auth_refresh_trigger: Arc::new(Mutex::new(false)),
             allocated_ram_gb: launcher_config.allocated_ram_gb.clamp(1, max_ram_gb),
             cpu_cores: launcher_config.cpu_cores.clamp(1, max_cpu_cores),
+            swap_usage_gb: launcher_config.swap_usage_gb.min(detected_swap_gb),
+            detected_swap_gb,
             use_dedicated_gpu: launcher_config.use_dedicated_gpu,
             enable_gpu_optimizations: launcher_config.enable_gpu_optimizations,
-            custom_jvm_args: launcher_config.custom_jvm_args.clone(),
+            custom_jvm_args: sync_resource_jvm_args(
+                &launcher_config.custom_jvm_args,
+                launcher_config.allocated_ram_gb.clamp(1, max_ram_gb),
+                launcher_config.swap_usage_gb.min(detected_swap_gb),
+            ),
             java_status: Arc::new(Mutex::new("Checking Java runtime...".to_string())),
             is_installing_java: Arc::new(Mutex::new(false)),
-            launch_started_at: None,
             last_saved_config: launcher_config,
             loader_availability: Arc::new(Mutex::new(HashMap::new())),
             is_checking_loader_availability: Arc::new(Mutex::new(false)),
@@ -2440,11 +2696,11 @@ impl FusionLauncherApp {
             selected_loader: self.selected_loader.clone(),
             selected_mod_profile: self.selected_mod_profile,
             profile_names: normalize_profile_names(self.profile_names.clone()),
-            profile_colors: normalize_profile_colors(self.profile_colors.clone()),
             profile_images: normalize_profile_images(self.profile_images.clone()),
             username: self.username.clone(),
             allocated_ram_gb: self.allocated_ram_gb,
             cpu_cores: self.cpu_cores,
+            swap_usage_gb: self.swap_usage_gb,
             use_dedicated_gpu: self.use_dedicated_gpu,
             enable_gpu_optimizations: self.enable_gpu_optimizations,
             custom_jvm_args: self.custom_jvm_args.clone(),
@@ -2458,11 +2714,11 @@ impl FusionLauncherApp {
             && current_config.selected_loader == self.last_saved_config.selected_loader
             && current_config.selected_mod_profile == self.last_saved_config.selected_mod_profile
             && current_config.profile_names == self.last_saved_config.profile_names
-            && current_config.profile_colors == self.last_saved_config.profile_colors
             && current_config.profile_images == self.last_saved_config.profile_images
             && current_config.username == self.last_saved_config.username
             && current_config.allocated_ram_gb == self.last_saved_config.allocated_ram_gb
             && current_config.cpu_cores == self.last_saved_config.cpu_cores
+            && current_config.swap_usage_gb == self.last_saved_config.swap_usage_gb
             && current_config.use_dedicated_gpu == self.last_saved_config.use_dedicated_gpu
             && current_config.enable_gpu_optimizations
                 == self.last_saved_config.enable_gpu_optimizations
@@ -2504,13 +2760,22 @@ impl FusionLauncherApp {
         };
 
         format!(
-            "{}GB RAM, {} CPU cores, {}, {}, JVM args: {}",
+            "{}GB RAM, {}GB swap allowance, {} CPU cores, {}, {}, JVM args: {}",
             self.allocated_ram_gb,
+            self.swap_usage_gb,
             self.cpu_cores,
             gpu_mode,
             gpu_optimizations,
             self.custom_jvm_args.trim()
         )
+    }
+
+    fn sync_jvm_args_to_selected_resources(&mut self) {
+        self.custom_jvm_args = sync_resource_jvm_args(
+            &self.custom_jvm_args,
+            self.allocated_ram_gb,
+            self.swap_usage_gb,
+        );
     }
 
     fn current_game_dir(&self) -> PathBuf {
@@ -2581,7 +2846,14 @@ impl FusionLauncherApp {
         }
 
         let mut migrated_count = 0;
-        for folder in ["mods", "config", "saves", "resourcepacks", "shaderpacks", "logs"] {
+        for folder in [
+            "mods",
+            "config",
+            "saves",
+            "resourcepacks",
+            "shaderpacks",
+            "logs",
+        ] {
             let source = legacy_instance_dir.join(folder);
             let target = target_instance_dir.join(folder);
             if source.exists() && !target.exists() {
@@ -2776,11 +3048,10 @@ impl FusionLauncherApp {
         let ctx_refresh = ctx.clone();
 
         std::thread::spawn(move || {
-            let status = if let Some(path) = Self::system_java_path() {
-                format!("Java runtime detected at {}.", path.display())
+        let status = if Self::system_java_path().is_some() {
+                "Java installed.".to_string()
             } else {
-                "System Java not found. Play can still use the launcher's managed Java runtime."
-                    .to_string()
+                "Java not found. Managed Java can still be used during launch.".to_string()
             };
 
             *java_status.lock().unwrap() = status;
@@ -2869,11 +3140,11 @@ impl FusionLauncherApp {
 
     fn ensure_java_before_launch(&self, ctx: &egui::Context) -> bool {
         if let Some(path) = Self::system_java_path() {
-            *self.java_status.lock().unwrap() =
-                format!("Java runtime detected at {}.", path.display());
+            *self.java_status.lock().unwrap() = "Java installed.".to_string();
+            self.log_to_terminal(&format!("Java runtime detected at {}.", path.display()));
         } else {
             *self.java_status.lock().unwrap() =
-                "System Java not found. Using launcher-managed Java during launch.".to_string();
+                "Java not found. Using launcher-managed Java during launch.".to_string();
             self.log_to_terminal(
                 "System Java was not found on PATH/JAVA_HOME. Continuing because the launch backend can install/use managed Java.",
             );
@@ -2913,15 +3184,16 @@ impl FusionLauncherApp {
         }
         self.refresh_mods_list();
 
-        self.launch_started_at = Some(Instant::now());
         let request = self.build_launch_request();
         let status_text = Arc::clone(&self.status_text);
         let is_launching = Arc::clone(&self.is_launching);
+        let launch_progress = Arc::clone(&self.launch_progress);
         let terminal_logs = Arc::clone(&self.terminal_logs);
         let ctx_refresh = ctx.clone();
         let launch_summary = self.launch_settings_summary();
 
         *is_launching.lock().unwrap() = true;
+        set_launch_progress(&launch_progress, 0.03, "Preparing launch.");
         *status_text.lock().unwrap() = format!(
             "Launching {} {}...",
             request.selected_loader, request.selected_version
@@ -2934,16 +3206,23 @@ impl FusionLauncherApp {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let launch_result = launch_minecraft(request, Arc::clone(&terminal_logs)).await;
+                let launch_result = launch_minecraft(
+                    request,
+                    Arc::clone(&terminal_logs),
+                    Arc::clone(&launch_progress),
+                )
+                .await;
 
                 match launch_result {
                     Ok(()) => {
+                        set_launch_progress(&launch_progress, 1.0, "Minecraft closed.");
                         *status_text.lock().unwrap() = "Minecraft closed.".to_string();
                         if let Ok(mut logs) = terminal_logs.lock() {
                             logs.push("[LAUNCH] Minecraft process finished.".to_string());
                         }
                     }
                     Err(e) => {
+                        set_launch_progress(&launch_progress, 1.0, "Launch failed.");
                         *status_text.lock().unwrap() = format!("Launch failed: {}", e);
                         write_crash_log(&format!("Launch failed: {}", e));
                         if let Ok(mut logs) = terminal_logs.lock() {
@@ -2956,20 +3235,6 @@ impl FusionLauncherApp {
                 ctx_refresh.request_repaint();
             });
         });
-    }
-
-    fn analyze_current_crash_logs(&mut self) {
-        self.crash_analysis_results = analyze_crash_sources(&self.current_game_dir());
-        *self.status_text.lock().unwrap() = format!(
-            "Crash helper found {} item{}.",
-            self.crash_analysis_results.len(),
-            if self.crash_analysis_results.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
-        self.log_to_terminal("Crash helper analyzed launcher and instance logs.");
     }
 
     fn trigger_mod_search(&self, ctx: &egui::Context, target_db: &str) {
@@ -3003,7 +3268,6 @@ impl FusionLauncherApp {
                 if let Some(loader_category) = match selected_loader.as_str() {
                     "Fabric" => Some("fabric"),
                     "Quilt" => Some("quilt"),
-                    "Forge" => Some("forge"),
                     "NeoForge" => Some("neoforge"),
                     _ => None,
                 } {
@@ -3699,7 +3963,11 @@ impl FusionLauncherApp {
         if fs::rename(&source_path, &target_path).is_ok() {
             self.log_to_terminal(&format!(
                 "{} {}.",
-                if currently_enabled { "Disabled" } else { "Enabled" },
+                if currently_enabled {
+                    "Disabled"
+                } else {
+                    "Enabled"
+                },
                 pack_display_name(&pack_name)
             ));
         }
@@ -3746,7 +4014,7 @@ impl FusionLauncherApp {
                 let mut availability = HashMap::new();
                 availability.insert("Vanilla".to_string(), true);
 
-                for loader in ["Fabric", "Quilt", "Forge", "NeoForge"] {
+                for loader in ["Fabric", "Quilt", "NeoForge"] {
                     let supported = resolve_loader_version(loader, &version).await.is_ok();
                     availability.insert(loader.to_string(), supported);
                 }
@@ -3823,13 +4091,74 @@ impl FusionLauncherApp {
         self.log_to_terminal(&format!("Updated settings for {}.", final_name));
     }
 
+    fn export_profile_to_folder(&mut self, profile: u8) {
+        let export_dir = profile_export_dir(profile);
+        let zip_path = profile_export_zip_path(profile);
+        match export_profile_zip(profile, &zip_path) {
+            Ok(()) => {
+                *self.status_text.lock().unwrap() = format!("Exported {}.", zip_path.display());
+                if let Err(e) = open_folder(&export_dir) {
+                    self.log_to_terminal(&format!("[ERROR] {}", e));
+                }
+                self.log_to_terminal(&format!(
+                    "Exported {} to {}.",
+                    self.profile_display_name(profile),
+                    zip_path.display()
+                ));
+            }
+            Err(e) => {
+                *self.status_text.lock().unwrap() = e.clone();
+                self.log_to_terminal(&format!("[ERROR] {}", e));
+            }
+        }
+    }
+
+    fn import_profile_from_folder(&mut self, profile: u8) {
+        let import_dir = profile_import_dir(profile);
+        if let Err(e) = open_folder(&import_dir) {
+            self.log_to_terminal(&format!("[ERROR] {}", e));
+        }
+
+        let Some(zip_path) = newest_zip_in_dir(&import_dir) else {
+            *self.status_text.lock().unwrap() = format!(
+                "Put a profile .zip in {} and click Import again.",
+                import_dir.display()
+            );
+            return;
+        };
+
+        match import_profile_zip(profile, &zip_path) {
+            Ok(()) => {
+                *self.status_text.lock().unwrap() = format!("Imported {}.", zip_path.display());
+                if self.selected_mod_profile == profile {
+                    self.refresh_mods_list();
+                }
+                self.log_to_terminal(&format!(
+                    "Imported {} into {}.",
+                    zip_path.display(),
+                    self.profile_display_name(profile)
+                ));
+            }
+            Err(e) => {
+                *self.status_text.lock().unwrap() = e.clone();
+                self.log_to_terminal(&format!("[ERROR] {}", e));
+            }
+        }
+    }
+
     fn show_mod_profiles_tab(&mut self, ui: &mut egui::Ui) {
         self.profile_names = normalize_profile_names(self.profile_names.clone());
-        self.profile_colors = normalize_profile_colors(self.profile_colors.clone());
 
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.label(egui::RichText::new("Mod Profiles").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Export writes to each profile's export folder. Import reads the newest .zip from its import folder.",
+                )
+                .small()
+                .weak(),
+            );
             ui.add_space(6.0);
 
             for profile in 1..=MAX_MOD_PROFILES {
@@ -3840,11 +4169,18 @@ impl FusionLauncherApp {
                         [170.0, 22.0],
                         egui::TextEdit::singleline(&mut self.profile_names[index]),
                     );
-
-                    let mut color = profile_color_from_rgba(self.profile_colors[index]);
-                    if ui.color_edit_button_srgba(&mut color).changed() {
-                        self.profile_colors[index] = profile_color_to_rgba(color);
-                    }
+                    let profile_size = format_bytes(profile_game_data_size_bytes(profile));
+                    ui.label(egui::RichText::new(profile_size).small().weak());
+                    let mod_count = count_profile_mod_files(profile);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} mod{}",
+                            mod_count,
+                            if mod_count == 1 { "" } else { "s" }
+                        ))
+                        .small()
+                        .weak(),
+                    );
 
                     if self.selected_mod_profile == profile {
                         ui.label(egui::RichText::new("Active").small().strong());
@@ -3860,6 +4196,13 @@ impl FusionLauncherApp {
                                 self.profile_display_name(self.selected_mod_profile)
                             ));
                         }
+                    }
+
+                    if ui.small_button("Export").clicked() {
+                        self.export_profile_to_folder(profile);
+                    }
+                    if ui.small_button("Import").clicked() {
+                        self.import_profile_from_folder(profile);
                     }
                 });
             }
@@ -3889,8 +4232,13 @@ impl FusionLauncherApp {
                 ui.add_space(8.0);
                 ui.label("Image path");
                 ui.text_edit_singleline(&mut self.profile_settings_image);
-                ui.label(egui::RichText::new("Leave image blank to use the default profile style.").small().weak());
+                ui.label(
+                    egui::RichText::new("Leave image blank to use the default profile style.")
+                        .small()
+                        .weak(),
+                );
 
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         save_requested = true;
@@ -3946,10 +4294,6 @@ impl FusionLauncherApp {
 impl eframe::App for FusionLauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.show_profile_settings_window(ctx);
-
-        if !*self.is_launching.lock().unwrap() {
-            self.launch_started_at = None;
-        }
 
         let microsoft_username = self
             .ms_profile
@@ -4150,7 +4494,6 @@ impl eframe::App for FusionLauncherApp {
                                 .show_ui(ui, |ui| {
                                     if self.is_loader_supported("Fabric") { ui.selectable_value(&mut self.selected_loader, "Fabric".to_string(), "Fabric 🟢"); }
                                     if self.is_loader_supported("Quilt") { ui.selectable_value(&mut self.selected_loader, "Quilt".to_string(), "Quilt 🟣"); }
-                                    if self.is_loader_supported("Forge") { ui.selectable_value(&mut self.selected_loader, "Forge".to_string(), "Forge 🧡"); }
                                     if self.is_loader_supported("NeoForge") { ui.selectable_value(&mut self.selected_loader, "NeoForge".to_string(), "NeoForge 🔥"); }
                                     if self.is_loader_supported("Vanilla") { ui.selectable_value(&mut self.selected_loader, "Vanilla".to_string(), "Vanilla 🟥"); }
                                 });
@@ -4179,21 +4522,13 @@ impl eframe::App for FusionLauncherApp {
 
                         if *self.is_launching.lock().unwrap() {
                             ui.add_space(10.0);
-                            let elapsed = self
-                                .launch_started_at
-                                .map(|started| started.elapsed().as_secs())
-                                .unwrap_or(0);
-                            let progress =
-                                (elapsed as f32 / EXPECTED_LAUNCH_SECONDS as f32).clamp(0.03, 1.0);
-                            let percent = (progress * 100.0).round() as u32;
-                            let progress_text = if percent >= 100 {
-                                "Done.".to_string()
-                            } else {
-                                format!("Preparing game... {}%", percent)
-                            };
+                            let launch_progress = self.launch_progress.lock().unwrap().clone();
+                            let percent = (launch_progress.fraction * 100.0).round() as u32;
+                            let progress_text =
+                                format!("{} {}%", launch_progress.label, percent);
 
                             ui.add(
-                                egui::ProgressBar::new(progress)
+                                egui::ProgressBar::new(launch_progress.fraction)
                                     .animate(true)
                                     .desired_width(260.0)
                                     .text(progress_text),
@@ -4211,7 +4546,9 @@ impl eframe::App for FusionLauncherApp {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("📂 Open Folder").clicked() {
                                     let mods_dir = self.current_mods_dir();
-                                    let _ = std::process::Command::new("explorer").arg(mods_dir).spawn();
+                                    if let Err(e) = open_folder(&mods_dir) {
+                                        self.log_to_terminal(&format!("[ERROR] {}", e));
+                                    }
                                 }
 
                                 if ui.button("Check Compatibility").clicked() {
@@ -4392,9 +4729,9 @@ impl eframe::App for FusionLauncherApp {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("Open Shaderpacks Folder").clicked() {
                                     let shaderpacks_dir = self.current_shaderpacks_dir();
-                                    let _ = std::process::Command::new("explorer")
-                                        .arg(shaderpacks_dir)
-                                        .spawn();
+                                    if let Err(e) = open_folder(&shaderpacks_dir) {
+                                        self.log_to_terminal(&format!("[ERROR] {}", e));
+                                    }
                                 }
                             });
                         });
@@ -4589,9 +4926,9 @@ impl eframe::App for FusionLauncherApp {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("Open Resourcepacks Folder").clicked() {
                                     let resourcepacks_dir = self.current_resourcepacks_dir();
-                                    let _ = std::process::Command::new("explorer")
-                                        .arg(resourcepacks_dir)
-                                        .spawn();
+                                    if let Err(e) = open_folder(&resourcepacks_dir) {
+                                        self.log_to_terminal(&format!("[ERROR] {}", e));
+                                    }
                                 }
                             });
                         });
@@ -4816,64 +5153,26 @@ impl eframe::App for FusionLauncherApp {
 
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(egui::RichText::new("Crash Helper").strong());
-                        ui.add_space(6.0);
-
-                        ui.horizontal(|ui| {
-                            if ui.button("Analyze Latest Crash").clicked() {
-                                self.analyze_current_crash_logs();
-                            }
-                            if ui.button("Open Crash Log").clicked() {
-                                let _ = std::process::Command::new("notepad")
-                                    .arg(crash_log_path())
-                                    .spawn();
-                            }
-                        });
-
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical()
-                            .id_source("crash_helper_results")
-                            .max_height(120.0)
-                            .show(ui, |ui| {
-                                if self.crash_analysis_results.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Run the analyzer after a failed launch.",
-                                        )
-                                        .weak()
-                                        .italics(),
-                                    );
-                                } else {
-                                    for finding in &self.crash_analysis_results {
-                                        ui.label(
-                                            egui::RichText::new(finding)
-                                                .small()
-                                                .monospace(),
-                                        );
-                                    }
-                                }
-                            });
-                    });
-
-                    ui.add_space(10.0);
-
-                    ui.group(|ui| {
-                        ui.set_width(ui.available_width());
                         ui.label(egui::RichText::new("Performance").strong());
                         ui.add_space(6.0);
 
                         let max_ram_gb = system_ram_limit_gb();
                         let max_cores = system_cpu_limit();
+                        self.detected_swap_gb = self.detected_swap_gb.max(system_swap_limit_gb());
                         self.allocated_ram_gb = self.allocated_ram_gb.clamp(1, max_ram_gb);
                         self.cpu_cores = self.cpu_cores.clamp(1, max_cores);
+                        self.swap_usage_gb = self.swap_usage_gb.min(self.detected_swap_gb);
 
                         ui.horizontal(|ui| {
                             ui.label("Allocated RAM:");
-                            ui.add(
+                            let ram_response = ui.add(
                                 egui::Slider::new(&mut self.allocated_ram_gb, 1..=max_ram_gb)
                                     .suffix(" GB")
                                     .clamp_to_range(true),
                             );
+                            if ram_response.changed() {
+                                self.sync_jvm_args_to_selected_resources();
+                            }
                         });
 
                         ui.horizontal(|ui| {
@@ -4885,11 +5184,43 @@ impl eframe::App for FusionLauncherApp {
                             );
                         });
 
+                        ui.horizontal(|ui| {
+                            ui.label("Swap allowance:");
+                            let swap_response = ui.add_enabled(
+                                self.detected_swap_gb > 0,
+                                egui::Slider::new(
+                                    &mut self.swap_usage_gb,
+                                    0..=self.detected_swap_gb.max(1),
+                                )
+                                .suffix(" GB")
+                                .clamp_to_range(true),
+                            );
+                            if swap_response.changed() {
+                                self.sync_jvm_args_to_selected_resources();
+                            }
+                            if ui.button("Rescan").clicked() {
+                                self.detected_swap_gb = system_swap_limit_gb();
+                                self.swap_usage_gb = self.swap_usage_gb.min(self.detected_swap_gb);
+                                self.sync_jvm_args_to_selected_resources();
+                                self.log_to_terminal(&format!(
+                                    "Detected {}GB system swap/pagefile.",
+                                    self.detected_swap_gb
+                                ));
+                            }
+                        });
+
                         ui.label(
                             egui::RichText::new(format!(
-                                "Detected system limits: {} GB RAM, {} CPU cores.",
-                                max_ram_gb, max_cores
+                                "Detected system limits: {} GB RAM, {} GB swap/pagefile, {} CPU cores.",
+                                max_ram_gb, self.detected_swap_gb, max_cores
                             ))
+                            .small()
+                            .weak(),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Swap allowance is saved for launcher planning; the OS still controls actual swap use.",
+                            )
                             .small()
                             .weak(),
                         );
@@ -4899,29 +5230,26 @@ impl eframe::App for FusionLauncherApp {
 
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(egui::RichText::new("Graphics").strong());
-                        ui.add_space(6.0);
-
-                        ui.checkbox(&mut self.use_dedicated_gpu, "Prefer dedicated GPU");
-                        ui.checkbox(
-                            &mut self.enable_gpu_optimizations,
-                            "Enable GPU optimization JVM flags",
-                        );
-                    });
-
-                    ui.add_space(10.0);
-
-                    ui.group(|ui| {
-                        ui.set_width(ui.available_width());
                         ui.label(egui::RichText::new("Advanced JVM Args").strong());
                         ui.add_space(6.0);
-                        ui.text_edit_multiline(&mut self.custom_jvm_args);
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(self.launch_settings_summary())
-                                .small()
-                                .weak(),
-                        );
+                        if ui.text_edit_multiline(&mut self.custom_jvm_args).changed() {
+                            if let Some(ram_gb) = parse_xmx_ram_gb(&self.custom_jvm_args) {
+                                self.allocated_ram_gb = ram_gb.clamp(1, system_ram_limit_gb());
+                            }
+                            if let Some(swap_gb) = parse_swap_allowance_gb(&self.custom_jvm_args) {
+                                self.swap_usage_gb = swap_gb.min(self.detected_swap_gb);
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Sync Resource Args").clicked() {
+                                self.sync_jvm_args_to_selected_resources();
+                            }
+                            if ui.button("Reset JVM Defaults").clicked() {
+                                self.custom_jvm_args =
+                                    "-XX:+UseG1GC -XX:+UnlockExperimentalVMOptions".to_string();
+                                self.sync_jvm_args_to_selected_resources();
+                            }
+                        });
                     });
                 }
             }
